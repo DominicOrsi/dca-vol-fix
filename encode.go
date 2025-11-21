@@ -670,8 +670,3 @@ func (e *EncodeSession) FFMPEGMessages() string {
 	e.Unlock()
 	return output
 }
-
-// logln helper to prevent undefined errors if your package relied on an external logger
-func logln(a ...interface{}) {
-	fmt.Println(a...)
-}
