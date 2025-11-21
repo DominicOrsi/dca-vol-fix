@@ -116,9 +116,9 @@ type Frame struct {
 
 type EncodeSession struct {
 	sync.Mutex
-	options    *EncodeOptions
-	pipeReader io.Reader
-	filePath   string
+	options      *EncodeOptions
+	pipeReader   io.Reader
+	filePath     string
 
 	running      bool
 	started      time.Time
@@ -197,6 +197,10 @@ func (e *EncodeSession) run() {
 	args := []string{
 		"-stats",
 		"-i", inFile,
+		// ---------------------------------------------------------
+		// UPDATED: Use machine-readable progress on stderr (pipe:2)
+		// ---------------------------------------------------------
+		"-progress", "pipe:2",
 		"-reconnect", "1",
 		"-reconnect_at_eof", "1",
 		"-reconnect_streamed", "1",
@@ -420,73 +424,78 @@ func (e *EncodeSession) writeMetadataFrame() {
 	e.frameChannel <- &Frame{buf.Bytes(), true}
 }
 
+// readStderr reads from stderr, parsing the new key=value format from -progress
 func (e *EncodeSession) readStderr(stderr io.ReadCloser, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	bufReader := bufio.NewReader(stderr)
-	var outBuf bytes.Buffer
-	for {
-		r, _, err := bufReader.ReadRune()
-		if err != nil {
-			if err != io.EOF {
-				logln("Error Reading stderr:", err)
-			}
-			break
-		}
+	// We use a scanner to read line by line
+	scanner := bufio.NewScanner(stderr)
 
-		// Is this the best way to distinguish stats from messages?
-		switch r {
-		case '\r':
-			// Stats line
-			if outBuf.Len() > 0 {
-				e.handleStderrLine(outBuf.String())
-				outBuf.Reset()
+	// We need a temporary struct to accumulate stats for the current batch
+	currentStats := &EncodeStats{}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// If the line contains "=", it's likely a progress key-value pair
+		if strings.Contains(line, "=") {
+			parts := strings.SplitN(line, "=", 2)
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+
+			switch key {
+			case "total_size":
+				// val is in bytes
+				s, _ := strconv.Atoi(val)
+				currentStats.Size = s
+
+			case "out_time_us":
+				// val is microseconds
+				us, _ := strconv.ParseInt(val, 10, 64)
+				currentStats.Duration = time.Duration(us) * time.Microsecond
+
+			case "bitrate":
+				// val is like "128.5kbits/s", we need to strip units
+				val = strings.TrimSuffix(val, "kbits/s")
+				f, _ := strconv.ParseFloat(val, 32)
+				currentStats.Bitrate = float32(f)
+
+			case "speed":
+				// val is like "1.52x", strip "x"
+				val = strings.TrimSuffix(val, "x")
+				f, _ := strconv.ParseFloat(val, 32)
+				currentStats.Speed = float32(f)
+
+			case "progress":
+				// "continue" or "end" marks the end of a stats batch
+				if val == "continue" || val == "end" {
+					e.Lock()
+					e.lastStats = &EncodeStats{
+						Size:     currentStats.Size,
+						Duration: currentStats.Duration,
+						Bitrate:  currentStats.Bitrate,
+						Speed:    currentStats.Speed,
+					}
+					e.Unlock()
+				}
 			}
-		case '\n':
-			// Message
+		} else {
+			// This is a normal log message (not a stat)
 			e.Lock()
-			e.ffmpegOutput += outBuf.String() + "\n"
+			e.ffmpegOutput += line + "\n"
 			e.Unlock()
-			outBuf.Reset()
-		default:
-			outBuf.WriteRune(r)
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		logln("Error scanning stderr:", err)
 	}
 }
 
+// handleStderrLine is deprecated/unused in this new version, logic moved to readStderr
 func (e *EncodeSession) handleStderrLine(line string) {
-	if strings.Index(line, "size=") != 0 {
-		return // Not stats info
-	}
-
-	var size int
-
-	var timeH int
-	var timeM int
-	var timeS float32
-
-	var bitrate float32
-	var speed float32
-
-	_, err := fmt.Sscanf(line, "size=%dkB time=%d:%d:%f bitrate=%fkbits/s speed=%fx", &size, &timeH, &timeM, &timeS, &bitrate, &speed)
-	if err != nil {
-		logln("Error parsing ffmpeg stats:", err)
-	}
-
-	dur := time.Duration(timeH) * time.Hour
-	dur += time.Duration(timeM) * time.Minute
-	dur += time.Duration(timeS) * time.Second
-
-	stats := &EncodeStats{
-		Size:     size,
-		Duration: dur,
-		Bitrate:  bitrate,
-		Speed:    speed,
-	}
-
-	e.Lock()
-	e.lastStats = stats
-	e.Unlock()
+	// Left empty to satisfy interface or legacy calls if any,
+	// but the logic is now entirely inside readStderr.
 }
 
 func (e *EncodeSession) readStdout(stdout io.ReadCloser) {
@@ -621,7 +630,6 @@ func (e *EncodeSession) Cleanup() {
 
 	for _ = range e.frameChannel {
 		// empty till closed
-		// Cats can be right-pawed or left-pawed.
 	}
 }
 
@@ -661,4 +669,9 @@ func (e *EncodeSession) FFMPEGMessages() string {
 	output := e.ffmpegOutput
 	e.Unlock()
 	return output
+}
+
+// logln helper to prevent undefined errors if your package relied on an external logger
+func logln(a ...interface{}) {
+	fmt.Println(a...)
 }
